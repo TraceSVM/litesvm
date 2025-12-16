@@ -318,7 +318,7 @@ use {
     solana_stake_interface::stake_history::StakeHistory,
     solana_svm_log_collector::LogCollector,
     solana_svm_timings::ExecuteTimings,
-    solana_svm_transaction::svm_message::SVMMessage,
+    solana_svm_transaction::svm_message::SVMStaticMessage,
     solana_system_program::{get_system_account_kind, SystemAccountKind},
     solana_sysvar::{Sysvar, SysvarSerialize},
     solana_sysvar_id::SysvarId,
@@ -338,6 +338,27 @@ use {
 
 pub mod error;
 pub mod types;
+
+/// Re-export tracer types when semantic-tracer feature is enabled.
+#[cfg(feature = "semantic-tracer")]
+pub mod tracer {
+    pub use solana_sbpf::tracer::{
+        TraceContext, TraceEvent, TraceResult, TracedCallFrame,
+        InstructionEvent, MemoryAccessEvent, SyscallEvent,
+        FunctionCallEvent, FunctionReturnEvent, MemoryRegionType, MemoryAccessType,
+        Tracer,
+        // CFG types
+        ControlFlowGraph, BasicBlock, CfgEdge, EdgeType, DetectedLoop, LoopBound,
+        BlockTerminator, BranchCondition, BranchComparand, BranchTakenInfo,
+        // Dataflow types
+        DataFlowState, ValueDefinition, ValueUse, ValueLocation, ValueOrigin,
+        TaintLabel, DefId, MemoryStore, OperationType, UseType,
+        // Queryable trace format
+        QueryableTrace, ExecutionSummary, FunctionIndexEntry, FunctionTrace,
+        SCHEMA_DESCRIPTION,
+    };
+    pub use solana_program_runtime::invoke_context::TracingConfig;
+}
 
 mod accounts_db;
 mod callback;
@@ -1035,6 +1056,223 @@ impl LiteSVM {
         }
     }
 
+    #[cfg(feature = "semantic-tracer")]
+    fn process_transaction_traced<'a, 'b>(
+        &'a self,
+        tx: &'b SanitizedTransaction,
+        compute_budget_limits: ComputeBudgetLimits,
+        log_collector: Rc<RefCell<LogCollector>>,
+        enable_cfg: bool,
+        enable_dataflow: bool,
+    ) -> (
+        Result<(), TransactionError>,
+        u64,
+        Option<TransactionContext<'b>>,
+        u64,
+        Option<Pubkey>,
+        Vec<tracer::TraceContext>,
+    )
+    where
+        'a: 'b,
+    {
+        let compute_budget = self.compute_budget.unwrap_or_else(|| ComputeBudget {
+            compute_unit_limit: u64::from(compute_budget_limits.compute_unit_limit),
+            heap_size: compute_budget_limits.updated_heap_bytes,
+            ..ComputeBudget::new_with_defaults(false, false)
+        });
+        let blockhash = tx.message().recent_blockhash();
+        //reload program cache
+        let mut program_cache_for_tx_batch = self.accounts.programs_cache.clone();
+        let mut accumulated_consume_units = 0;
+        let message = tx.message();
+        let account_keys = message.account_keys();
+        let instruction_accounts = message
+            .instructions()
+            .iter()
+            .flat_map(|instruction| &instruction.accounts)
+            .unique()
+            .collect::<Vec<&u8>>();
+        let fee = solana_fee::calculate_fee(
+            message,
+            false,
+            self.fee_structure.lamports_per_signature,
+            0,
+            FeeFeatures::from(&self.feature_set),
+        );
+        let mut validated_fee_payer = false;
+        let mut payer_key = None;
+        let maybe_accounts = account_keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let mut account_found = true;
+                let account = if solana_sdk_ids::sysvar::instructions::check_id(key) {
+                    construct_instructions_account(message)
+                } else {
+                    let instruction_account = u8::try_from(i)
+                        .map(|i| instruction_accounts.contains(&&i))
+                        .unwrap_or(false);
+                    let mut account = if !instruction_account
+                        && !message.is_writable(i)
+                        && self.accounts.programs_cache.find(key).is_some()
+                    {
+                        // Optimization to skip loading of accounts which are only used as
+                        // programs in top-level instructions and not passed as instruction accounts.
+                        self.accounts.get_account(key).unwrap()
+                    } else {
+                        self.accounts.get_account(key).unwrap_or_else(|| {
+                            account_found = false;
+                            let mut default_account = AccountSharedData::default();
+                            default_account.set_rent_epoch(0);
+                            default_account
+                        })
+                    };
+                    if !validated_fee_payer
+                        && (!message.is_invoked(i) || message.is_instruction_account(i))
+                    {
+                        validate_fee_payer(
+                            key,
+                            &mut account,
+                            i as IndexOfAccount,
+                            &self.accounts.sysvar_cache.get_rent().unwrap(),
+                            fee,
+                        )?;
+                        validated_fee_payer = true;
+                        payer_key = Some(*key);
+                    }
+                    account
+                };
+
+                Ok((*key, account))
+            })
+            .collect::<solana_transaction_error::TransactionResult<Vec<_>>>();
+        let mut accounts = match maybe_accounts {
+            Ok(accs) => accs,
+            Err(e) => {
+                return (Err(e), accumulated_consume_units, None, fee, payer_key, Vec::new());
+            }
+        };
+        if !validated_fee_payer {
+            error!("Failed to validate fee payer");
+            return (
+                Err(TransactionError::AccountNotFound),
+                accumulated_consume_units,
+                None,
+                fee,
+                payer_key,
+                Vec::new(),
+            );
+        }
+        let builtins_start_index = accounts.len();
+        let maybe_program_indices = tx
+            .message()
+            .instructions()
+            .iter()
+            .map(|c| {
+                let program_index = c.program_id_index as usize;
+                // This may never error, because the transaction is sanitized
+                let (program_id, program_account) = accounts.get(program_index).unwrap();
+                if native_loader::check_id(program_id) {
+                    return Ok(program_index as IndexOfAccount);
+                }
+                if !program_account.executable() {
+                    error!("Program account {program_id} is not executable.");
+                    return Err(TransactionError::InvalidProgramForExecution);
+                }
+
+                let owner_id = program_account.owner();
+                if native_loader::check_id(owner_id) {
+                    return Ok(program_index as IndexOfAccount);
+                }
+
+                if !accounts
+                    .get(builtins_start_index..)
+                    .ok_or(TransactionError::ProgramAccountNotFound)?
+                    .iter()
+                    .any(|(key, _)| key == owner_id)
+                {
+                    let owner_account = self.accounts.get_account(owner_id).unwrap();
+                    if !native_loader::check_id(owner_account.owner()) {
+                        error!(
+                            "Owner account {owner_id} is not owned by the native loader program."
+                        );
+                        return Err(TransactionError::InvalidProgramForExecution);
+                    }
+                    if !owner_account.executable() {
+                        error!("Owner account {owner_id} is not executable");
+                        return Err(TransactionError::InvalidProgramForExecution);
+                    }
+                    //Add program_id to the stuff
+                    accounts.push((*owner_id, owner_account));
+                }
+                Ok(program_index as IndexOfAccount)
+            })
+            .collect::<Result<Vec<u16>, TransactionError>>();
+
+        match maybe_program_indices {
+            Ok(program_indices) => {
+                let mut context = self.create_transaction_context(compute_budget, accounts);
+                let feature_set = self.feature_set.runtime_features();
+                let mut invoke_context = InvokeContext::new(
+                    &mut context,
+                    &mut program_cache_for_tx_batch,
+                    EnvironmentConfig::new(
+                        *blockhash,
+                        self.fee_structure.lamports_per_signature,
+                        self,
+                        &feature_set,
+                        &self.accounts.environments,
+                        &self.accounts.environments,
+                        &self.accounts.sysvar_cache,
+                    ),
+                    Some(log_collector),
+                    compute_budget.to_budget(),
+                    SVMTransactionExecutionCost::default(),
+                );
+
+                // Enable tracing before processing
+                invoke_context.enable_tracing(enable_cfg, enable_dataflow);
+
+                #[cfg(feature = "invocation-inspect-callback")]
+                self.invocation_inspect_callback.before_invocation(
+                    tx,
+                    &program_indices,
+                    &invoke_context,
+                );
+
+                let mut tx_result = process_message(
+                    tx.message(),
+                    &program_indices,
+                    &mut invoke_context,
+                    &mut ExecuteTimings::default(),
+                    &mut accumulated_consume_units,
+                )
+                .map(|_| ());
+
+                #[cfg(feature = "invocation-inspect-callback")]
+                self.invocation_inspect_callback
+                    .after_invocation(&invoke_context);
+
+                // Extract traces after processing
+                let traces = invoke_context.take_trace_contexts();
+
+                if let Err(err) = self.check_accounts_rent(tx, &context) {
+                    tx_result = Err(err);
+                };
+
+                (
+                    tx_result,
+                    accumulated_consume_units,
+                    Some(context),
+                    fee,
+                    payer_key,
+                    traces,
+                )
+            }
+            Err(e) => (Err(e), accumulated_consume_units, None, fee, payer_key, Vec::new()),
+        }
+    }
+
     fn check_accounts_rent(
         &self,
         tx: &SanitizedTransaction,
@@ -1129,6 +1367,77 @@ impl LiteSVM {
         }
     }
 
+    #[cfg(feature = "semantic-tracer")]
+    fn execute_transaction_traced(
+        &mut self,
+        tx: VersionedTransaction,
+        log_collector: Rc<RefCell<LogCollector>>,
+        enable_cfg: bool,
+        enable_dataflow: bool,
+    ) -> (ExecutionResult, Vec<tracer::TraceContext>) {
+        match self.sanitize_transaction(tx) {
+            Ok(s_tx) => self.execute_sanitized_transaction_traced(&s_tx, log_collector, enable_cfg, enable_dataflow),
+            Err(e) => (e, Vec::new()),
+        }
+    }
+
+    #[cfg(feature = "semantic-tracer")]
+    fn execute_transaction_no_verify_traced(
+        &mut self,
+        tx: VersionedTransaction,
+        log_collector: Rc<RefCell<LogCollector>>,
+        enable_cfg: bool,
+        enable_dataflow: bool,
+    ) -> (ExecutionResult, Vec<tracer::TraceContext>) {
+        match self.sanitize_transaction_no_verify(tx) {
+            Ok(s_tx) => self.execute_sanitized_transaction_traced(&s_tx, log_collector, enable_cfg, enable_dataflow),
+            Err(e) => (e, Vec::new()),
+        }
+    }
+
+    #[cfg(feature = "semantic-tracer")]
+    fn execute_sanitized_transaction_traced(
+        &mut self,
+        sanitized_tx: &SanitizedTransaction,
+        log_collector: Rc<RefCell<LogCollector>>,
+        enable_cfg: bool,
+        enable_dataflow: bool,
+    ) -> (ExecutionResult, Vec<tracer::TraceContext>) {
+        let (check_result, traces) = self.check_and_process_transaction_traced(
+            sanitized_tx,
+            log_collector,
+            enable_cfg,
+            enable_dataflow,
+        );
+        let CheckAndProcessTransactionSuccess {
+            core:
+                CheckAndProcessTransactionSuccessCore {
+                    result,
+                    compute_units_consumed,
+                    context,
+                },
+            fee,
+            payer_key,
+        } = match check_result {
+            Ok(value) => value,
+            Err(value) => return (value, traces),
+        };
+        if let Some(ctx) = context {
+            let mut exec_result =
+                execution_result_if_context(sanitized_tx, ctx, result, compute_units_consumed);
+
+            if let Some(payer) = payer_key.filter(|_| exec_result.tx_result.is_err()) {
+                exec_result.tx_result = self
+                    .accounts
+                    .withdraw(&payer, fee)
+                    .and(exec_result.tx_result);
+            }
+            (exec_result, traces)
+        } else {
+            (ExecutionResult::result_and_compute_units(result, compute_units_consumed), traces)
+        }
+    }
+
     fn execute_sanitized_transaction_readonly(
         &self,
         sanitized_tx: &SanitizedTransaction,
@@ -1177,6 +1486,42 @@ impl LiteSVM {
             fee,
             payer_key,
         })
+    }
+
+    #[cfg(feature = "semantic-tracer")]
+    fn check_and_process_transaction_traced<'a, 'b>(
+        &'a self,
+        sanitized_tx: &'b SanitizedTransaction,
+        log_collector: Rc<RefCell<LogCollector>>,
+        enable_cfg: bool,
+        enable_dataflow: bool,
+    ) -> (Result<CheckAndProcessTransactionSuccess<'b>, ExecutionResult>, Vec<tracer::TraceContext>)
+    where
+        'a: 'b,
+    {
+        if let Err(e) = self.maybe_blockhash_check(sanitized_tx) {
+            return (Err(e), Vec::new());
+        }
+        let compute_budget_limits = match get_compute_budget_limits(sanitized_tx, &self.feature_set) {
+            Ok(v) => v,
+            Err(e) => return (Err(e), Vec::new()),
+        };
+        if let Err(e) = self.maybe_history_check(sanitized_tx) {
+            return (Err(e), Vec::new());
+        }
+        let (result, compute_units_consumed, context, fee, payer_key, traces) =
+            self.process_transaction_traced(sanitized_tx, compute_budget_limits, log_collector, enable_cfg, enable_dataflow);
+        (Ok(CheckAndProcessTransactionSuccess {
+            core: {
+                CheckAndProcessTransactionSuccessCore {
+                    result,
+                    compute_units_consumed,
+                    context,
+                }
+            },
+            fee,
+            payer_key,
+        }), traces)
     }
 
     fn maybe_history_check(
@@ -1269,6 +1614,77 @@ impl LiteSVM {
 
             TransactionResult::Ok(meta)
         }
+    }
+
+    /// Submits a signed transaction with semantic tracing enabled.
+    ///
+    /// This method executes the transaction and captures detailed execution traces
+    /// including instruction-level events, memory accesses, syscalls, and optionally
+    /// control flow graph and data flow analysis.
+    ///
+    /// # Arguments
+    /// * `tx` - The transaction to execute
+    /// * `enable_cfg` - If true, builds a control flow graph during execution
+    /// * `enable_dataflow` - If true, performs data flow analysis during execution
+    ///
+    /// # Returns
+    /// A tuple of (TransactionResult, Vec<TraceContext>) where TraceContext contains
+    /// the traces for each BPF program executed during the transaction.
+    #[cfg(feature = "semantic-tracer")]
+    pub fn send_transaction_traced(
+        &mut self,
+        tx: impl Into<VersionedTransaction>,
+        enable_cfg: bool,
+        enable_dataflow: bool,
+    ) -> (TransactionResult, Vec<tracer::TraceContext>) {
+        let log_collector = LogCollector {
+            bytes_limit: self.log_bytes_limit,
+            ..Default::default()
+        };
+        let log_collector = Rc::new(RefCell::new(log_collector));
+        let vtx: VersionedTransaction = tx.into();
+        let (execution_result, traces) = if self.sigverify {
+            self.execute_transaction_traced(vtx, log_collector.clone(), enable_cfg, enable_dataflow)
+        } else {
+            self.execute_transaction_no_verify_traced(vtx, log_collector.clone(), enable_cfg, enable_dataflow)
+        };
+        let ExecutionResult {
+            post_accounts,
+            tx_result,
+            signature,
+            compute_units_consumed,
+            inner_instructions,
+            return_data,
+            included,
+        } = execution_result;
+        let Ok(logs) = Rc::try_unwrap(log_collector).map(|lc| lc.into_inner().messages) else {
+            unreachable!("Log collector should not be used after send_transaction_traced returns")
+        };
+        let meta = TransactionMetadata {
+            logs,
+            inner_instructions,
+            compute_units_consumed,
+            return_data,
+            signature,
+        };
+
+        let result = if let Err(tx_err) = tx_result {
+            let err = TransactionResult::Err(FailedTransactionMetadata { err: tx_err, meta });
+            if included {
+                self.history.add_new_transaction(signature, err.clone());
+            }
+            err
+        } else {
+            self.history
+                .add_new_transaction(signature, Ok(meta.clone()));
+            self.accounts
+                .sync_accounts(post_accounts)
+                .expect("It shouldn't be possible to write invalid sysvars in send_transaction_traced.");
+
+            TransactionResult::Ok(meta)
+        };
+
+        (result, traces)
     }
 
     /// Simulates a transaction.
@@ -1474,7 +1890,7 @@ fn get_compute_budget_limits(
     feature_set: &FeatureSet,
 ) -> Result<ComputeBudgetLimits, ExecutionResult> {
     process_compute_budget_instructions(
-        SVMMessage::program_instructions_iter(sanitized_tx),
+        sanitized_tx.program_instructions_iter(),
         feature_set,
     )
     .map_err(|e| ExecutionResult {

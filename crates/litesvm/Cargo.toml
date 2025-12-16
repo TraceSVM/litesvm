@@ -15,6 +15,7 @@ nodejs-internal = ["dep:qualifier_attr"]
 hashbrown = ["dep:hashbrown"]
 serde = []
 precompiles = ["dep:agave-precompiles"]
+semantic-tracer = ["solana-bpf-loader-program/semantic-tracer", "solana-sbpf/semantic-tracer", "solana-program-runtime/semantic-tracer"]
 
 [dependencies]
 agave-feature-set.workspace = true
@@ -65,6 +66,7 @@ solana-program-error.workspace = true
 solana-program-runtime.workspace = true
 solana-pubkey.workspace = true
 solana-rent.workspace = true
+solana-sbpf.workspace = true
 solana-sdk-ids.workspace = true
 solana-sha256-hasher.workspace = true
 solana-signature.workspace = true
@@ -90,6 +92,7 @@ criterion.workspace = true
 ed25519-dalek.workspace = true
 libsecp256k1.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 solana-clock.workspace = true
 solana-compute-budget-interface.workspace = true
 solana-config-interface = { workspace = true, features = ["bincode"] }
@@ -123,3 +126,7 @@ harness = false
 [[bench]]
 name = "hashing"
 harness = false
+
+[[example]]
+name = "trace_program"
+required-features = ["semantic-tracer"]
