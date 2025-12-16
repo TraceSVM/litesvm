@@ -3603,6 +3603,7 @@ checksum = "dcf09694a0fc14e5ffb18f9b7b7c0f15ecb6eac5b5610bf76a1853459d19daf9"
 [[package]]
 name = "solana-sbpf"
 version = "0.13.1"
+source = "git+https://github.com/TraceSVM/sbpf.git#8a70082dd72a6895ec486373dea2c7bb081e2f2e"
 dependencies = [
  "byteorder",
  "combine",
